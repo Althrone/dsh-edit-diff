@@ -1,0 +1,11 @@
+# dsh-edit-diff bundle patch.
+#
+# Install through the official Plugin Manager，任选一种 target：
+#   本地目录：  <your path>/dsh-edit-diff
+#   Git 仓库：  git+https://github.com/<you>/dsh-edit-diff.git
+#
+# Do not hand-edit the profile's cordis.patch.yml; install_bundle merges this row.
+
+- insert:
+    - id: dsh-edit-diff
+      name: 'dsh-edit-diff'

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Edit Diff",
+    "description": "Follows the agent's edits: opens the file in the native preview with syntax highlighting and Markdown intact, plus a side-by-side diff tab with per-line and syntax highlighting."
+  }
+}
