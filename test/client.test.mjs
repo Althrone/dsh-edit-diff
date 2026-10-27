@@ -156,9 +156,25 @@ check('registers the diff page type (no patterns, so no extension takeover)', ()
 })
 
 check('registers the diff body in sidebar.right.pane.tab', () => {
-  if (slotRegs.length !== 1) throw new Error('slotRegs=' + slotRegs.length)
-  if (slotRegs[0].def.name !== 'sidebar.right.pane.tab') throw new Error('slot=' + slotRegs[0].def.name)
-  if (typeof slotRegs[0].component !== 'function') throw new Error('body is not a component')
+  const body = slotRegs.filter((r) => r.def.name === 'sidebar.right.pane.tab')
+  if (body.length !== 1) throw new Error('pane.tab registrations=' + body.length)
+  if (typeof body[0].component !== 'function') throw new Error('body is not a component')
+})
+
+check('registers the settings page under plugins.row.config', () => {
+  const page = slotRegs.filter((r) => r.def.name === 'plugins.row.config')
+  if (page.length !== 1) throw new Error('plugins.row.config registrations=' + page.length)
+  if (page[0].def.key !== 'dsh-edit-diff#dsh-edit-diff') {
+    throw new Error('key=' + page[0].def.key)
+  }
+  if (typeof page[0].component !== 'function') throw new Error('settings page is not a component')
+})
+
+check('does not pollute the general settings page', () => {
+  const general = slotRegs.filter((r) => r.def.name === 'settings.general.item')
+  if (general.length !== 0) {
+    throw new Error('settings.general.item still has ' + general.length + ' registration(s)')
+  }
 })
 
 check('never registers a documentPreviews renderer', () => {

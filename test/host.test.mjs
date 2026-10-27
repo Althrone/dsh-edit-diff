@@ -53,8 +53,8 @@ check('read tool ignored', editFromCall({ name: 'read', arguments: { path: 'c' }
 check('stateSchema accepts init state', (() => {
   const s = definition.init({ id: 's1' })
   definition.stateSchema.parse(s)
-  return s
-})(), { sessionId: 's1', pending: null, last: null })
+  return [s.sessionId, s.pending, s.last]
+})(), ['s1', null, null])
 
 check('stateSchema rejects garbage', (() => {
   try {
@@ -65,7 +65,10 @@ check('stateSchema rejects garbage', (() => {
   }
 })(), 'rejected')
 
-check('viewSchema accepts null', (() => { definition.wire.viewSchema.parse(null); return 'ok' })(), 'ok')
+check('viewSchema accepts an empty view', (() => {
+  definition.wire.viewSchema.parse({ last: null, files: [] })
+  return 'ok'
+})(), 'ok')
 
 // 折叠：成功的 edit → last 带行号
 check('fold successful edit', (() => {
@@ -80,7 +83,7 @@ check('fold successful edit', (() => {
     time: 200,
     data: { message: { source: { callId: 'call1' }, isError: false } },
   })
-  const view = definition.wire.view(state)
+  const view = definition.wire.view(state).last
   return [view.path, view.command, view.line, view.ts, state.pending]
 })(), ['a.ts', 'edit', null, 200, null])
 
@@ -96,7 +99,7 @@ check('failed edit is not followed', (() => {
     time: 200,
     data: { message: { source: { callId: 'c2' }, isError: true } },
   })
-  return [state.pending, definition.wire.view(state)]
+  return [state.pending, definition.wire.view(state).last]
 })(), [null, null])
 
 check('init exposes stateVersion', typeof definition.stateVersion, 'number')

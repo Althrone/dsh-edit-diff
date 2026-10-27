@@ -59,7 +59,41 @@ check('c file still highlights', () => {
   if (languageOf('a.c') !== 'c') throw new Error('c lost its language')
 })
 
-const md = fs.readFileSync('follow-new.md', 'utf8')
+// 自带样例内容，不依赖工作区里会被改动的文件。
+const md = [
+  '# 哈希表实现笔记',
+  '',
+  '一个用链地址法解决冲突的字符串哈希表，**纯 C11**。',
+  '',
+  '## 核心操作',
+  '',
+  '| 操作 | 复杂度 |',
+  '|---|---|',
+  '| `table_increment` | 平均 O(1) |',
+  '| `table_lookup` | 平均 O(1) |',
+  '',
+  '## 哈希函数',
+  '',
+  '```c',
+  'static unsigned long hash_of(const char *s)',
+  '{',
+  '    unsigned long h = 5381;',
+  '    return h;',
+  '}',
+  '```',
+  '',
+  '> 为什么用无符号字符？因为 `char` 可能是有符号的。',
+  '',
+  '### 待办',
+  '',
+  '- [ ] 加上 `table_remove`',
+  '- [x] 最长链统计',
+  '',
+  '---',
+  '',
+  '*最后更新：测试用文件*',
+  '',
+].join('\n')
 
 // 新建语义
 const after = md.replace(/\r\n/g, '\n')

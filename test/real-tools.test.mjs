@@ -45,11 +45,15 @@ state = definition.apply(state, {
   time: 2000,
   data: { message: { source: { callId }, isError: false } },
 })
-const view = definition.wire.view(state)
+const view = definition.wire.view(state).last
 check('wire view for write', [view.path.split(/[\\/]/).pop(), view.command, view.line, view.ts], ['follow-test.c', 'write', 1, 2000])
 check('newStr carries content', view.newStr.includes('int main'), true)
 check('oldStr empty for create', view.oldStr, '')
-check('viewSchema accepts the real view', (() => { definition.wire.viewSchema.parse(view); return 'ok' })(), 'ok')
+check('viewSchema accepts the real view', (() => {
+  // wire view 结构是 { last, files }
+  definition.wire.viewSchema.parse({ last: view, files: [view] })
+  return 'ok'
+})(), 'ok')
 
 // 3) 真实的 edit 工具调用：file_path + old_string/new_string
 check('edit uses file_path + old/new_string', (() => {

@@ -31,6 +31,12 @@ window.__ModuleLoader__.load({
     const MAX_LOCATE_PAGES = 10
     const MAX_DIFF_CELLS = 4_000_000
     const DIFF_FOCUS_THROTTLE_MS = 700
+    /**
+     * 随导航参数携带的基线原文上限。
+     * 导航参数会进入侧栏布局的 localStorage 存档，所以不能无限制地带大文件；
+     * Host 侧另有 2 MiB 的读取上限，这里更保守，只带中小文件。
+     */
+    const MAX_CARRY_BEFORE = 256 * 1024
 
     /**
      * 占位用的不换行空格。
@@ -38,6 +44,52 @@ window.__ModuleLoader__.load({
      * 用 NBSP 保证「留空的单元格」仍然占一行高度（VS Code 的 diff 同样留白占位）。
      */
     const NBSP = '\u00A0'
+
+    // ── 跟随偏好 ────────────────────────────────────────────────────
+    //
+    // 每次编辑都强制打开侧栏会打断人，所以给三档可选行为，存在 localStorage。
+    // 纯浏览器侧偏好：不涉及 Host，改完立刻生效，不需要重启。
+
+    /** 打开行为：always=每次；turn=每轮首次；off=只更新不打开。 */
+    const FOLLOW_KEY = 'dsh-edit-diff:follow'
+    const FOLLOW_MODES = ['always', 'turn', 'off']
+    const FOLLOW_DEFAULT = 'turn'
+
+    function readFollowMode() {
+      try {
+        const v = globalThis.localStorage?.getItem(FOLLOW_KEY)
+        return FOLLOW_MODES.includes(v) ? v : FOLLOW_DEFAULT
+      } catch {
+        return FOLLOW_DEFAULT
+      }
+    }
+
+    function writeFollowMode(mode) {
+      try {
+        globalThis.localStorage?.setItem(FOLLOW_KEY, mode)
+      } catch {
+        // localStorage 不可用时退回默认，不影响功能
+      }
+    }
+
+    /** 调试模式：显示「shell 改动无法对比」这类内部提示。默认关闭。 */
+    const DEBUG_KEY = 'dsh-edit-diff:debug'
+
+    function readDebugMode() {
+      try {
+        return globalThis.localStorage?.getItem(DEBUG_KEY) === '1'
+      } catch {
+        return false
+      }
+    }
+
+    function writeDebugMode(on) {
+      try {
+        globalThis.localStorage?.setItem(DEBUG_KEY, on ? '1' : '0')
+      } catch {
+        // localStorage 不可用时忽略
+      }
+    }
 
     const en = {
       title: 'Edit Diff',
@@ -53,6 +105,18 @@ window.__ModuleLoader__.load({
       loading: 'Loading file…',
       failed: 'Could not read the file.',
       gone: 'This file no longer exists (it was probably deleted or moved).',
+      follow: 'Auto-open',
+      followAlways: 'Every edit',
+      followTurn: 'First edit of each turn',
+      followOff: 'Off (update only)',
+      collapseAll: 'Collapse all',
+      expandAll: 'Expand all',
+      fileCount: '{n} file(s)',
+      debug: 'Debug info',
+      noBaseline: 'No before/after content recorded for this change.',
+      noChanges: 'No textual change detected.',
+      prevChange: 'Previous change',
+      nextChange: 'Next change',
     }
     const zh = {
       title: 'Edit Diff',
@@ -68,6 +132,18 @@ window.__ModuleLoader__.load({
       loading: '正在读取文件…',
       failed: '读取文件失败。',
       gone: '该文件已不存在（可能被删除或移动了）。',
+      follow: '自动打开',
+      followAlways: '每次编辑',
+      followTurn: '每轮首次编辑',
+      followOff: '关闭（只更新）',
+      collapseAll: '全部折叠',
+      expandAll: '全部展开',
+      fileCount: '{n} 个文件',
+      debug: '调试信息',
+      noBaseline: '这次改动没有记录到前后内容。',
+      noChanges: '没有检测到文本变化。',
+      prevChange: '上一处差异',
+      nextChange: '下一处差异',
     }
 
     // ── 轻量语法高亮 ────────────────────────────────────────────────
@@ -514,32 +590,341 @@ window.__ModuleLoader__.load({
      * 生成 diff 标签正文。remote 与翻译都从闭包取，不依赖 slot 的 inject 语义
      * （只有 `useTabInfo` 是框架固定注入的 prop）。
      */
-    function createDiffBody(remote, translate) {
+    function createDiffBody(sessions, remote, translate) {
+      /**
+       * 外层只做一件事：把内部渲染的任何异常变成可见的错误信息。
+       *
+       * 之前界面「一片空白」且没有任何线索，最可能就是内层抛异常后被框架
+       * 静默吞掉。宁可显示堆栈，也不要留白。
+       */
       return function DiffBody(props) {
+        try {
+          // 直接调用内层函数（而不是 h(DiffInner)）：
+          // React 稍后才渲染子组件，外层的 try/catch 捕不到它的异常。
+          return DiffInner(props)
+        } catch (error) {
+          const message = error instanceof Error ? (error.stack ?? error.message) : String(error)
+          return h('div', {
+            style: {
+              padding: '16px',
+              fontSize: '11.5px',
+              lineHeight: '1.6',
+              color: 'var(--dsw-alias-state-error-primary)',
+              background: 'var(--dsw-alias-bg-base)',
+              whiteSpace: 'pre-wrap',
+              wordBreak: 'break-word',
+              overflow: 'auto',
+              height: '100%',
+              boxSizing: 'border-box',
+            },
+          }, 'Edit Diff 渲染失败：\n' + message)
+        }
+      }
+
+      function DiffInner(props) {
         const tr = translate
-        const useTabInfo = props.useTabInfo
-      const info = useTabInfo()
-      const tab = info === undefined || info === null ? undefined : info.tab
-      const params = tab?.navigation?.params ?? {}
-      const revision = tab?.navigation?.revision ?? 0
+        const tab = (() => {
+          try {
+            const info = props.useTabInfo()
+            return info === undefined || info === null ? undefined : info.tab
+          } catch {
+            return undefined
+          }
+        })()
+
+        /**
+         * 会话 id 有两条来源：
+         *   1. slot 的 inject(sessionId) —— 正常路径
+         *   2. 标签自身的导航/地址 —— 兜底
+         * 只依赖 (1) 时，一旦 slot 没把 inject 结果合并进 props，页面就完全空白。
+         */
+        const sessionId = (() => {
+          if (typeof props.sessionId === 'string' && props.sessionId.length > 0) {
+            return props.sessionId
+          }
+          const fromAddress = parseSessionAddress(tab?.contentId ?? '')
+          if (fromAddress !== undefined) return fromAddress.sessionId
+          const fromParams = tab?.navigation?.params?.sessionId
+          return typeof fromParams === 'string' && fromParams.length > 0 ? fromParams : undefined
+        })()
+
+        /**
+         * 直接订阅投影，不依赖导航参数。
+         *
+         * page 标签在同一个 pane 内会自动去重：openTab 只是把已有标签聚焦，
+         * 并不会替换 navigation.params —— 所以早先版本靠 params 传数据，
+         * 标签一旦开过就永远读到空的参数，界面只能显示「还没有记录到改动」。
+         * 投影是会话级状态，订阅它就绕开了整个参数传递问题。
+         */
+        const EMPTY_VIEW = { last: null, files: [] }
+        const normalizeView = (v) => {
+          if (v === null || typeof v !== 'object') return EMPTY_VIEW
+          return {
+            last: v.last ?? null,
+            files: Array.isArray(v.files) ? v.files : [],
+          }
+        }
+        const [view, setView] = useState(() => normalizeView(readProjection(sessions, sessionId)))
+        useEffect(() => {
+          if (sessionId === undefined) {
+            setView(EMPTY_VIEW)
+            return undefined
+          }
+          const face = projectionFace(sessions, sessionId)
+          if (face === undefined) {
+            setView(EMPTY_VIEW)
+            return undefined
+          }
+          const read = () => {
+            try {
+              return normalizeView(face.getSnapshot())
+            } catch {
+              return EMPTY_VIEW
+            }
+          }
+          setView(read())
+          // 订阅是增强项：拿不到 subscribe 也不该让整个面板空掉。
+          try {
+            if (typeof face.subscribe === 'function') {
+              return face.subscribe(() => setView(read()))
+            }
+          } catch {
+            // 退化为一次性读取
+          }
+          return undefined
+        }, [sessionId])
+
+        const files = useMemo(
+          () => (Array.isArray(view?.files) ? view.files : []).filter(
+            (f) => f !== null && typeof f === 'object' && typeof f.path === 'string',
+          ),
+          [view],
+        )
+
+        if (files.length === 0) {
+          // 诊断信息：正常情况下用户看不到，但页面空白时必须能看出卡在哪一步。
+          const diag = [
+            'sessionId=' + String(sessionId),
+            'propsKeys=' + Object.keys(props ?? {}).join(','),
+            'view=' + (view === null ? 'null' : typeof view),
+            'files=' + (Array.isArray(view?.files) ? view.files.length : 'n/a'),
+            'loc=' + String(tr('empty')),
+          ].join(' | ')
+          return h('div', {
+            style: {
+              minHeight: '120px',
+              display: 'flex',
+              flexDirection: 'column',
+              alignItems: 'center',
+              justifyContent: 'center',
+              gap: '8px',
+              padding: '24px',
+              fontSize: '12.5px',
+              color: 'var(--dsw-alias-label-secondary)',
+              textAlign: 'center',
+              background: 'var(--dsw-alias-bg-base)',
+            },
+          },
+            h('div', {}, (() => {
+              const text = tr('empty')
+              return typeof text === 'string' && text.length > 0 ? text : '本会话还没有记录到改动。'
+            })()),
+            h('div', {
+              style: { fontSize: '10px', opacity: 0.7, wordBreak: 'break-all' },
+            }, diag),
+          )
+        }
+
+        // 一键折叠/展开全部。存 localStorage 记住用户偏好不必要——
+        // 这是「当前视图」的操作，刷新后回到默认全展开更符合预期。
+        const [allCollapsed, setAllCollapsed] = useState(false)
+        // 每次「全部折叠/展开」递增，用于通知各分组丢弃自己的局部折叠状态。
+        const [allToken, setAllToken] = useState(0)
+        const debug = readDebugMode()
+
+        // 每个文件一个可折叠分组。
+        //
+        // 根容器不用 height:100% / minHeight:0：父级高度不确定时，这两个会让
+        // 整块塌成 0 高（表现就是「标签页一片空白」）。改成自然高度 + 自身滚动。
+        return h('div', {
+          style: {
+            display: 'flex',
+            flexDirection: 'column',
+            maxHeight: '100%',
+            overflowY: 'auto',
+            background: 'var(--dsw-alias-bg-base)',
+            color: 'var(--dsw-alias-label-primary)',
+          },
+        },
+          // 工具条：一键折叠 + 文件计数
+          h('div', {
+            style: {
+              display: 'flex',
+              alignItems: 'center',
+              gap: '8px',
+              padding: '4px 10px',
+              flex: 'none',
+              borderBottom: '1px solid var(--dsw-alias-border-l1)',
+              background: 'var(--dsw-alias-bg-base)',
+            },
+          },
+            h('button', {
+              type: 'button',
+              'data-cline-collapse-all': true,
+              'aria-expanded': allCollapsed ? 'false' : 'true',
+              title: allCollapsed ? tr('expandAll') : tr('collapseAll'),
+              onClick: () => {
+                setAllCollapsed((v) => !v)
+                setAllToken((t) => t + 1)
+              },
+              style: {
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '4px',
+                padding: '2px 8px',
+                fontSize: '11.5px',
+                cursor: 'pointer',
+                borderRadius: '5px',
+                border: '1px solid var(--dsw-alias-border-l1)',
+                background: 'var(--dsw-alias-bg-layer-1)',
+                color: 'var(--dsw-alias-label-secondary)',
+                flex: 'none',
+              },
+            },
+              h('span', {
+                'aria-hidden': true,
+                style: {
+                  display: 'inline-block',
+                  fontSize: '10px',
+                  transform: allCollapsed ? 'none' : 'rotate(90deg)',
+                  transition: 'transform 120ms',
+                },
+              }, '▶'),
+              allCollapsed ? tr('expandAll') : tr('collapseAll'),
+            ),
+            h('span', {
+              style: {
+                fontSize: '11px',
+                color: 'var(--dsw-alias-label-secondary)',
+                marginLeft: 'auto',
+                flex: 'none',
+              },
+            }, tr('fileCount').replace('{n}', String(files.length))),
+          ),
+          h('div', {
+            style: {
+              flex: '1 1 auto',
+              minHeight: 0,
+              overflowY: 'auto',
+            },
+          }, files.map((entry, index) => h(FileSection, {
+            key: normPath(entry.path) + '#' + index,
+            entry,
+            sessionId,
+            revision: tab?.navigation?.revision ?? 0,
+            remote,
+            tr,
+            debug,
+            dark: readDarkTheme(),
+            // 只是「默认值」：单点表头可以在局部覆盖它。
+            defaultCollapsed: allCollapsed,
+            // 每次点「全部折叠/展开」都换一个 token，让各分组清掉局部覆盖。
+            allToken,
+          }))),
+        )
+      }
+    }
+
+    /** 取某个会话的投影 face（可能因为会话未绑定而拿不到）。 */
+    function projectionFace(sessions, sessionId) {
+      try {
+        const binding = sessions.binding(sessionId)
+        if (binding === undefined) return undefined
+        return binding.session.projections.faceOf(PROJECTION_KEY)
+      } catch {
+        return undefined
+      }
+    }
+
+    /** 同步读一次投影当前值，供首次渲染使用。 */
+    function readProjection(sessions, sessionId) {
+      if (sessionId === undefined) return { last: null, files: [] }
+      const face = projectionFace(sessions, sessionId)
+      if (face === undefined) return { last: null, files: [] }
+      try {
+        return face.getSnapshot() ?? { last: null, files: [] }
+      } catch {
+        return { last: null, files: [] }
+      }
+    }
+
+    /** 暗色主题由 ui-theme 写在 body 上；每次渲染读一次即可。 */
+    function readDarkTheme() {
+      try {
+        return typeof document !== 'undefined' && document.body?.hasAttribute('data-ds-dark-theme') === true
+      } catch {
+        return false
+      }
+    }
+
+    // ── 单文件分组 ──────────────────────────────────────────────────
+
+    /**
+     * 一个文件一个可折叠分组。
+     * 表头只显示文件名和 +N −M（以及折叠箭头），点一下收起/展开。
+     *
+     * 折叠状态由外部（DiffBody 的一键折叠）控制：collapsed 是受控 prop，
+     * 没有受控时退回内部 state，保证单独使用也能工作。
+     */
+    function FileSection(props) {
+      const { entry, sessionId, revision, remote, tr, dark, debug } = props
+
+      /**
+       * 折叠状态分两层：
+       *   · `defaultCollapsed` 来自「全部折叠 / 全部展开」按钮，变化时覆盖所有分组
+       *   · `localOverride` 是用户单独点某个表头的结果
+       * 点表头只影响自己，绝不应触发全局折叠——之前把 onToggle 直接接到
+       * setAllCollapsed，导致点任意一个表头都在翻转整个列表。
+       */
+      const [localOverride, setLocalOverride] = useState(undefined)
+      const defaultCollapsed = props.defaultCollapsed === true
+      const collapsed = localOverride === undefined ? defaultCollapsed : localOverride
+
+      // 「全部折叠」切换时清掉各分组的局部覆盖，让按钮真正生效。
+      // 用 effect 而不是渲染期比较：渲染期间 setState 会触发 React 警告。
+      const allToken = props.allToken
+      useEffect(() => {
+        setLocalOverride(undefined)
+      }, [allToken])
+
+      const toggleSelf = () => setLocalOverride((v) => !(v === undefined ? defaultCollapsed : v))
 
       const [text, setText] = useState(undefined)
       const [failure, setFailure] = useState(false)
       const [gone, setGone] = useState(false)
       const leftRef = useRef(null)
       const rightRef = useRef(null)
-      const parsed = useMemo(() => parseSessionAddress(tab?.contentId ?? ''), [tab?.contentId])
 
-      const path = params.path ?? (parsed === undefined ? '' : parsed.path)
-      const sessionId = parsed === undefined ? params.sessionId : parsed.sessionId
-      const oldStr = typeof params.oldStr === 'string' ? params.oldStr : ''
-      const newStr = typeof params.newStr === 'string' ? params.newStr : ''
-      const command = typeof params.command === 'string' ? params.command : ''
+      const path = typeof entry.path === 'string' ? entry.path : ''
+      const oldStr = typeof entry.oldStr === 'string' ? entry.oldStr : ''
+      const newStr = typeof entry.newStr === 'string' ? entry.newStr : ''
+      const command = typeof entry.command === 'string' ? entry.command : ''
       const shell = command === 'shell' || command === 'patch'
+      const beforeKnown = entry.beforeKnown === true
+      const beforeText = typeof entry.beforeText === 'string' ? entry.beforeText : null
+      const shellAfter = typeof entry.afterText === 'string' ? entry.afterText : null
 
+      // 折叠时【仍然】读文件：表头的 +N −M 需要最新内容才能算准。
+      // 之前折叠就跳过读取，导致折叠状态下再改动，统计停在旧值。
       useEffect(() => {
-        if (sessionId === undefined || path === undefined || path.length === 0) {
+        if (sessionId === undefined || path.length === 0) {
           setText(undefined)
+          return undefined
+        }
+        if (shellAfter !== null) {
+          setFailure(false)
+          setGone(false)
+          setText(shellAfter)
           return undefined
         }
         const lifetime = new AbortController()
@@ -551,7 +936,6 @@ window.__ModuleLoader__.load({
           },
           (error) => {
             if (lifetime.signal.aborted) return
-            // 文件被删除或移动是 shell 路径的正常结果，不该报成「读取失败」。
             const message = error instanceof Error ? error.message : String(error ?? '')
             const code = error?.code ?? ''
             setGone(
@@ -563,37 +947,41 @@ window.__ModuleLoader__.load({
           },
         )
         return () => lifetime.abort()
-      }, [sessionId, path, revision])
+      }, [sessionId, path, revision, shellAfter, collapsed])
 
+      // 折叠时【也要】计算 rows：表头的 +N −M 依赖它。
+      // 之前折叠就 return []，导致折叠状态下再改动，统计停在旧值不更新。
+      // 代价只是多算一次 diff，比显示错误的数字划算。
       const rows = useMemo(() => {
-        if (text === undefined || shell) return []
-        // 行尾符不参与 diff 语义，但会破坏 indexOf 定位（Host 记录的 \n 对上磁盘的 \r\n）。
-        // 两侧统一成 \n 再比较，消掉这一类假阴性。
+        if (text === undefined) return []
+        if (shell) {
+          if (!beforeKnown) return []
+          const before = beforeText === null ? '' : beforeText
+          return toSideBySide(diffLines(before, String(text)))
+        }
         const norm = (s) => String(s).replace(/\r\n/g, '\n')
         const after = norm(text)
+        if (beforeKnown) {
+          const before = beforeText === null ? '' : norm(beforeText)
+          return toSideBySide(diffLines(before, after))
+        }
+        // 没有基线时退回反推。
         const target = norm(newStr)
         const original = norm(oldStr)
-
         let before = after
-        // 整体写入类操作（create/write/patch）语义就是「整份文件都是新增」：
-        // oldStr 为空，不应靠 indexOf 反推，否则尾部换行等细微差异会算出残行。
         const wholesale = command === 'create' || command === 'write' || command === 'patch'
         if (wholesale) {
           before = ''
         } else if (target.length > 0) {
           const idx = after.indexOf(target)
-          if (idx >= 0) {
-            before = after.slice(0, idx) + original + after.slice(idx + target.length)
-          } else {
-            // 定位失败：宁可显示为「全部新增」，也不假装两边一样。
-            before = ''
-          }
+          before = idx >= 0 ? after.slice(0, idx) + original + after.slice(idx + target.length) : ''
         } else if (original.length > 0 && after.length === 0) {
           before = original
         }
         return toSideBySide(diffLines(before, after))
-      }, [text, oldStr, newStr, shell, command])
+      }, [text, oldStr, newStr, shell, command, beforeKnown, beforeText, collapsed])
 
+      // 统计直接从 rows 算；rows 现在折叠时也会更新，所以表头数字始终是最新的。
       const stats = useMemo(() => {
         let added = 0
         let removed = 0
@@ -604,65 +992,200 @@ window.__ModuleLoader__.load({
         return { added, removed }
       }, [rows])
 
-      // 纵向联动：左右两栏的行数一致，滚一边另一边跟着走，横向各自独立。
-      //
-      // 依赖 panesRendered 而不是 []：内容还没加载完时两栏根本没渲染，ref 是 null，
-      // 空依赖的 effect 会在那时跑一次就再也不会补挂监听。
-      const panesRendered = !shell && !gone && !failure && text !== undefined
-      useEffect(() => {
-        if (!panesRendered) return undefined
-        const left = leftRef.current
-        const right = rightRef.current
-        if (left === null || right === null) return undefined
-        return linkVerticalScroll(left, right)
-      }, [panesRendered])
+      let notice = null
+      if (collapsed) {
+        notice = null
+      } else if (shell) {
+        notice = beforeKnown ? null : (debug ? tr('shell') : tr('noBaseline'))
+      } else if (gone) {
+        notice = tr('gone')
+      } else if (failure) {
+        notice = tr('failed')
+      } else if (text === undefined) {
+        notice = tr('loading')
+      } else if (rows.length === 0) {
+        notice = command === 'create' ? tr('created') : tr('empty')
+      }
 
-      // 跳行：把改动行滚到两栏中间（横向保持不动）。
-      useEffect(() => {
-        const nodes = [leftRef.current, rightRef.current]
-        if (nodes.includes(null) || rows.length === 0) return
-        const { first } = changedSpan(rows, 'right')
-        for (const node of nodes) {
-          const target = node.querySelector(`[data-cline-side-row="${first}"]`)
-          if (target === null) continue
-          const top = target.offsetTop - node.clientHeight / 2 + target.offsetHeight / 2
-          node.scrollTop = Math.max(0, top)
+      // 最后一道保险：rows 为空且没有任何说明时，也给出中性提示。
+      if (!collapsed && notice === null && rows.length === 0 && text !== undefined) {
+        notice = tr('noChanges')
+      }
+
+      // 诊断兜底：本地化函数可能返回空串（locale 没绑上），
+      // 那样界面就是一片空白，看不出任何信息。这里给每个分支准备硬编码文案。
+      if (notice !== null && (typeof notice !== 'string' || notice.length === 0)) {
+        if (failure) notice = '读取文件失败。'
+        else if (gone) notice = '该文件已不存在。'
+        else if (text === undefined) notice = '正在读取文件…'
+        else notice = '没有可显示的差异。'
+      }
+
+      // 调试信息单独渲染在表头下方的一行小字里，
+      // 绝不能写进 notice —— notice 非 null 就会替换掉整个 diff 正文，
+      // 之前就是这里把 1593 行的正常内容顶掉了。
+      const debugLine = debug
+        ? 'rows=' + rows.length
+          + ' text=' + (text === undefined ? 'undef' : String(text.length))
+          + ' before=' + (beforeKnown ? (beforeText === null ? 'null' : String(beforeText.length)) : 'unknown')
+          + ' cmd=' + command
+          + ' shell=' + String(shell)
+        : null
+
+      // ── 表头：只有文件名 + 增删统计，点击折叠 ──
+      // ── 差异跳转 ──
+      // 记录当前停在哪个改动块（rows 索引），null 表示还没跳过。
+      const [diffCursor, setDiffCursor] = useState(null)
+
+      /** 所有改动块的首行索引（用于上/下跳转）。 */
+      const changeAnchors = useMemo(() => {
+        const out = []
+        for (let i = 0; i < rows.length; i++) {
+          if (rows[i].type !== 'eq') out.push(i)
         }
+        return out
       }, [rows])
 
-      const mono = {
-        // 用 dsh 的 code 字体 token（设置里「代码字体」改的就是它），
-        // 不再自己写栈：之前用的 --dsw-font-mono 并不存在，一直在走兜底。
-        fontFamily: 'var(--ds-font-family-code, "SF Mono", "JetBrains Mono", Consolas, "Courier New", monospace)',
-        fontSize: '12.5px',
-        // VS Code 的行高是 1.5，且开启亚像素抗锯齿后字形更柔；
-        // 这里同时给平滑相关属性，减轻小字号下的「锋利」观感。
-        lineHeight: '1.5',
-        whiteSpace: 'pre',
-        WebkitFontSmoothing: 'antialiased',
-        MozOsxFontSmoothing: 'grayscale',
-        textRendering: 'optimizeLegibility',
+      /** 滚到某个 rows 索引对应的行。 */
+      const scrollToRow = (index) => {
+        const node = rightRef.current
+        if (node === null) return
+        const target = node.querySelector(`[data-cline-side-row="${index}"]`)
+        if (target === null) return
+        const top = target.offsetTop - node.clientHeight / 2 + target.offsetHeight / 2
+        node.scrollTop = Math.max(0, top)
       }
-      // 行高用像素固定：两栏逐行对齐依赖它，不能让内容为空时塌陷。
-      // 12.5px × 1.5 = 18.75 → 取 20 留出余量，避免抗锯齿后字形被裁。
-      const rowHeightPx = 20
 
-      // 高亮语言按文件后缀决定；未知后缀保持纯文本。
+      /** 跳到下一处 / 上一处差异。 */
+      const jump = (direction) => {
+        if (changeAnchors.length === 0) return
+        const current = diffCursor === null ? -1 : changeAnchors.indexOf(diffCursor)
+        let next
+        if (direction > 0) {
+          next = current < 0 ? 0 : (current + 1) % changeAnchors.length
+        } else {
+          next = current <= 0 ? changeAnchors.length - 1 : current - 1
+        }
+        const anchor = changeAnchors[next]
+        setDiffCursor(anchor)
+        scrollToRow(anchor)
+      }
+
+      const jumpStyle = {
+        flex: 'none',
+        width: '18px',
+        height: '18px',
+        padding: '0',
+        fontSize: '10px',
+        lineHeight: '1',
+        cursor: 'pointer',
+        borderRadius: '4px',
+        border: '1px solid var(--dsw-alias-border-l1)',
+        background: 'var(--dsw-alias-bg-layer-1)',
+        color: 'var(--dsw-alias-label-secondary)',
+        display: 'inline-flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+      }
+
+      const header = h('div', {
+        'data-cline-file-header': path,
+        role: 'button',
+        tabIndex: 0,
+        title: path,
+        'aria-expanded': collapsed ? 'false' : 'true',
+        onClick: toggleSelf,
+        onKeyDown: (e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault()
+            toggleSelf()
+          }
+        },
+        style: {
+          display: 'flex',
+          alignItems: 'center',
+          gap: '8px',
+          padding: '6px 10px',
+          cursor: 'pointer',
+          flex: 'none',
+          userSelect: 'none',
+          borderBottom: collapsed ? 'none' : '1px solid var(--dsw-alias-border-l1)',
+          background: 'var(--dsw-specific-sidebar-fill)',
+        },
+      },
+        h('span', {
+          'aria-hidden': true,
+          style: {
+            flex: 'none',
+            width: '10px',
+            fontSize: '10px',
+            color: 'var(--dsw-alias-label-secondary)',
+            transform: collapsed ? 'none' : 'rotate(90deg)',
+            transition: 'transform 120ms',
+            display: 'inline-block',
+          },
+        }, '▶'),
+        h('span', {
+          style: {
+            flex: '1 1 auto',
+            minWidth: 0,
+            fontSize: '12px',
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap',
+            color: 'var(--dsw-alias-label-primary)',
+          },
+        }, baseName(path)),
+        stats.added > 0
+          ? h('span', {
+            style: { fontSize: '11.5px', flex: 'none', color: 'var(--dsw-alias-state-success-primary)' },
+          }, '+' + stats.added)
+          : null,
+        stats.removed > 0
+          ? h('span', {
+            style: { fontSize: '11.5px', flex: 'none', color: 'var(--dsw-alias-state-error-primary)' },
+          }, '−' + stats.removed)
+          : null,
+        // 差异跳转：上一处 / 下一处。stopPropagation 避免触发表头的折叠。
+        changeAnchors.length === 0
+          ? null
+          : h('span', {
+            style: { display: 'inline-flex', gap: '3px', flex: 'none', marginLeft: '2px' },
+          },
+            h('button', {
+              type: 'button',
+              'data-cline-jump': 'prev',
+              title: tr('prevChange'),
+              'aria-label': tr('prevChange'),
+              onClick: (e) => { e.stopPropagation(); jump(-1) },
+              style: jumpStyle,
+            }, '▲'),
+            h('button', {
+              type: 'button',
+              'data-cline-jump': 'next',
+              title: tr('nextChange'),
+              'aria-label': tr('nextChange'),
+              onClick: (e) => { e.stopPropagation(); jump(1) },
+              style: jumpStyle,
+            }, '▼'),
+          ),
+      )
+
+      // ── 高亮状态（必须在任何提前 return 之前调用，否则 Hooks 顺序错乱）──
       const lang = useMemo(() => languageOf(path), [path])
 
       // 跨行块注释状态：逐行前进，记录每行起始是否处于注释内。
-      // 按行词法无法自行知道上一行状态，所以先整体扫一遍。
       const blockState = useMemo(() => {
         const state = new Array(rows.length).fill(false)
         if (lang === null) return state
         let inBlock = false
         for (let i = 0; i < rows.length; i++) {
           state[i] = inBlock
-          const line = lang === null ? '' : (rows[i].left ?? rows[i].right ?? '')
+          const line = rows[i].left ?? rows[i].right ?? ''
           const open = line.lastIndexOf('/*')
           const close = line.lastIndexOf('*/')
           if (inBlock) {
-            if (close >= 0 && (open < close)) inBlock = false
+            if (close >= 0 && open < close) inBlock = false
           } else if (open >= 0 && (close < 0 || open > close)) {
             inBlock = true
           }
@@ -670,29 +1193,51 @@ window.__ModuleLoader__.load({
         return state
       }, [rows, lang])
 
-      // 暗色主题由 ui-theme 写在 body 上（body[data-ds-dark-theme]）。
-      // 订阅主题变化，明暗切换时重新取色。
-      const [dark, setDark] = useState(
-        () => typeof document !== 'undefined' && document.body?.hasAttribute('data-ds-dark-theme') === true,
-      )
+      // 纵向联动：左右两栏行数一致，滚一边另一边跟着走。
+      // 必须在提前 return 之前注册（Hook 顺序要求）。
+      const panesRendered = !collapsed && notice === null
       useEffect(() => {
-        if (typeof document === 'undefined' || typeof MutationObserver === 'undefined') return undefined
-        const read = () => setDark(document.body?.hasAttribute('data-ds-dark-theme') === true)
-        read()
-        const observer = new MutationObserver(read)
-        observer.observe(document.body, { attributes: true, attributeFilter: ['data-ds-dark-theme'] })
-        return () => observer.disconnect()
-      }, [])
+        if (!panesRendered) return undefined
+        const left = leftRef.current
+        const right = rightRef.current
+        if (left === null || right === null) return undefined
+        return linkVerticalScroll(left, right)
+      }, [panesRendered, rows])
+
+      if (collapsed) return h('div', { style: { flex: 'none' } }, header)
+
+      // ── 渲染辅助（每个分组私有） ──
+      const mono = {
+        fontFamily: 'var(--ds-font-family-code, "SF Mono", "JetBrains Mono", Consolas, "Courier New", monospace)',
+        fontSize: '12.5px',
+        lineHeight: '1.5',
+        whiteSpace: 'pre',
+        WebkitFontSmoothing: 'antialiased',
+        MozOsxFontSmoothing: 'grayscale',
+        textRendering: 'optimizeLegibility',
+      }
+      const rowHeightPx = 20
+
+      /** 有高亮的语言按 token 分段渲染；其余原样输出（空行用 NBSP 占位）。 */
+      function renderText(line, inBlock) {
+        if (line.length === 0) return NBSP
+        if (lang === null) return line
+        const parts = tokenizeLine(line, lang, inBlock === true)
+        if (parts.length === 1 && parts[0].kind === null) return line
+        return parts.map((part, i) => {
+          const color = tokenColor(part.kind, dark)
+          if (color === undefined) return part.text
+          return h('span', { key: i, style: { color } }, part.text)
+        })
+      }
 
       /** 一栏里的单行：行号 + 文本。 */
       function sideCell(row, index, side) {
         const isLeft = side === 'left'
-        const text = isLeft ? row.left : row.right
+        const line = isLeft ? row.left : row.right
         const lineNo = isLeft ? row.leftNo : row.rightNo
-        const present = text !== undefined
+        const present = line !== undefined
         const tint = isLeft ? 'rgba(229, 72, 77, 0.10)' : 'rgba(46, 160, 67, 0.12)'
-        // 对侧缺失时留空，但必须占一行高度：空字符串会让行高塌成 0，
-        // 导致下面的行与另一栏逐行错位（VS Code 的 diff 也是留空占位）。
         return h('div', {
           key: index,
           'data-cline-side-row': index,
@@ -714,21 +1259,8 @@ window.__ModuleLoader__.load({
           }, lineNo === undefined ? NBSP : String(lineNo)),
           h('span', {
             style: { ...mono, flex: 'none', color: 'var(--dsw-alias-label-primary)' },
-          }, present ? renderText(text, blockState[index] === true) : NBSP),
+          }, present ? renderText(line, blockState[index] === true) : NBSP),
         )
-      }
-
-      /** 有高亮的语言按 token 分段渲染；其余原样输出（空行用 NBSP 占位）。 */
-      function renderText(text, inBlock) {
-        if (text.length === 0) return NBSP
-        if (lang === null) return text
-        const parts = tokenizeLine(text, lang, inBlock === true)
-        if (parts.length === 1 && parts[0].kind === null) return text
-        return parts.map((part, i) => {
-          const color = tokenColor(part.kind, dark)
-          if (color === undefined) return part.text
-          return h('span', { key: i, style: { color } }, part.text)
-        })
       }
 
       /** 一栏：列头 + 自己的滚动区（各自一条水平滚动条）。 */
@@ -737,11 +1269,7 @@ window.__ModuleLoader__.load({
           style: {
             display: 'flex',
             flexDirection: 'column',
-            // 固定占 1fr 的一半，且 overflow:hidden 保证内容再宽也不会把栏顶大 ——
-            // 溢出必须由内层滚动区消化。
             minWidth: 0,
-            minHeight: 0,
-            overflow: 'hidden',
           },
         },
           h('div', {
@@ -756,12 +1284,14 @@ window.__ModuleLoader__.load({
           }, label),
           h('div', {
             ref,
-            // position:relative 让行的 offsetTop 相对这个滚动容器计算（跳行定位依赖它）。
-            style: { flex: '1 1 auto', minWidth: 0, minHeight: 0, overflow: 'auto', position: 'relative' },
+            style: {
+              maxHeight: '60vh',
+              minWidth: 0,
+              overflow: 'auto',
+              position: 'relative',
+            },
           },
             h('div', {
-              // 宽度交给浏览器按真实字形量（max-content），不再用字符数估算 ——
-              // 全角、制表符、宽字符都能算对。内容比栏窄时由 minWidth 铺满。
               style: {
                 minWidth: '100%',
                 width: 'max-content',
@@ -775,87 +1305,55 @@ window.__ModuleLoader__.load({
         )
       }
 
-      const header = h('div', {
-        style: {
-          display: 'flex',
-          alignItems: 'center',
-          gap: '10px',
-          padding: '8px 12px',
-          borderBottom: '1px solid var(--dsw-alias-border-l1)',
-          background: 'var(--dsw-specific-sidebar-fill)',
-          flex: 'none',
-        },
-      },
-        h('span', {
+      const body = notice !== null
+        ? h('div', {
           style: {
+            padding: '16px',
             fontSize: '12px',
-            color: 'var(--dsw-alias-label-primary)',
-            overflow: 'hidden',
-            textOverflow: 'ellipsis',
-            whiteSpace: 'nowrap',
-            minWidth: 0,
+            color: 'var(--dsw-alias-label-secondary)',
+            textAlign: 'center',
           },
-          title: path,
-        }, baseName(path)),
-        h('span', { style: { fontSize: '11.5px', color: 'var(--dsw-alias-state-success-primary)', flex: 'none' } }, '+' + stats.added),
-        h('span', { style: { fontSize: '11.5px', color: 'var(--dsw-alias-state-error-primary)', flex: 'none' } }, '−' + stats.removed),
-      )
-
-      let notice = null
-      if (shell) {
-        notice = tr('shell')
-      } else if (gone) {
-        notice = tr('gone')
-      } else if (failure) {
-        notice = tr('failed')
-      } else if (text === undefined) {
-        notice = tr('loading')
-      } else if (rows.length === 0) {
-        notice = command === 'create' ? tr('created') : tr('empty')
-      }
+        }, notice)
+        : h('div', {
+          style: {
+            // 横向两栏；纵向高度由内容撑开（行高固定），
+            // 不能用 minmax(0,1fr) —— 父级是 flex:none，1fr 会塌成 0 高度，
+            // 表现就是「表头在，正文一片空白」。
+            display: 'grid',
+            gridTemplateColumns: 'minmax(0,1fr) minmax(0,1fr)',
+            columnGap: '1px',
+            background: 'var(--dsw-alias-border-l1)',
+          },
+        },
+          pane('left', tr('original'), leftRef),
+          pane('right', tr('current'), rightRef),
+        )
 
       return h('div', {
         style: {
           display: 'flex',
           flexDirection: 'column',
-          height: '100%',
+          flex: 'none',
           minHeight: 0,
-          background: 'var(--dsw-alias-bg-base)',
-          color: 'var(--dsw-alias-label-primary)',
+          borderBottom: '1px solid var(--dsw-alias-border-l1)',
         },
       },
         header,
-        notice === null
-          ? h('div', {
-            style: {
-              flex: '1 1 auto',
-              minHeight: 0,
-              display: 'grid',
-              // 两栏严格等分；minmax(0,…) 允许子项被压缩，配合每栏的 overflow:hidden
-              // 保证内容再宽也不会改变列宽（横向滚动发生在栏内）。
-              gridTemplateColumns: 'minmax(0,1fr) minmax(0,1fr)',
-              gridTemplateRows: 'minmax(0,1fr)',
-              columnGap: '1px',
-              background: 'var(--dsw-alias-border-l1)',
-            },
-          },
-            pane('left', tr('original'), leftRef),
-            pane('right', tr('current'), rightRef),
-          )
+        debugLine === null
+          ? null
           : h('div', {
             style: {
-              flex: '1 1 auto',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              padding: '24px',
-              fontSize: '12.5px',
+              padding: '2px 10px',
+              fontSize: '10px',
+              lineHeight: '1.4',
               color: 'var(--dsw-alias-label-secondary)',
-              textAlign: 'center',
+              background: 'var(--dsw-alias-bg-layer-2)',
+              wordBreak: 'break-all',
+              flex: 'none',
             },
-          }, notice),
+          }, debugLine),
+        body,
       )
-      }
     }
 
     // ── 插件体 ──────────────────────────────────────────────────────
@@ -868,22 +1366,132 @@ window.__ModuleLoader__.load({
         const remote = ctx.remote
         const following = new Map()
         const lastDiffAt = new Map()
+        /** 已经为哪些会话打开过 diff 标签（off 模式下据此决定是否刷新）。 */
+        const diffOpened = new Set()
         const t = ctx.locale.bind('editDiff')
 
         ctx.effect(() => ctx.locale.register('editDiff', { en, zh }), 'dsh-edit-diff: copy')
 
+        // 设置项：自动打开行为。渲染在「设置 → 通用」里的一行。
+        /** 设置行的小工具：左侧标签 + 右侧控件。 */
+        function row(label, control) {
+          return h('div', {
+            style: {
+              display: 'flex',
+              alignItems: 'center',
+              gap: '12px',
+              width: '100%',
+              minWidth: 0,
+              padding: '6px 0',
+            },
+          },
+            h('span', {
+              style: {
+                fontSize: '13px',
+                color: 'var(--dsw-alias-label-primary)',
+                flex: '1 1 auto',
+                minWidth: 0,
+              },
+            }, label),
+            control,
+          )
+        }
+
+        const controlStyle = {
+          fontSize: '12.5px',
+          padding: '4px 8px',
+          borderRadius: '6px',
+          border: '1px solid var(--dsw-alias-border-l1)',
+          background: 'var(--dsw-alias-bg-layer-1)',
+          color: 'var(--dsw-alias-label-primary)',
+          flex: 'none',
+        }
+
+        function FollowSetting() {
+          const [mode, setMode] = useState(() => readFollowMode())
+          const tr2 = (key) => (typeof t === 'function' ? t(key) : key)
+          const options = [
+            ['always', tr2('followAlways')],
+            ['turn', tr2('followTurn')],
+            ['off', tr2('followOff')],
+          ]
+          return row(tr2('follow'), h('select', {
+            value: mode,
+            'aria-label': tr2('follow'),
+            onChange: (e) => {
+              const next = e.target.value
+              setMode(next)
+              writeFollowMode(next)
+            },
+            style: controlStyle,
+          }, options.map(([value, label]) => h('option', { key: value, value }, label))))
+        }
+
+        function DebugSetting() {
+          const [on, setOn] = useState(() => readDebugMode())
+          const tr2 = (key) => (typeof t === 'function' ? t(key) : key)
+          return row(tr2('debug'), h('input', {
+            type: 'checkbox',
+            checked: on,
+            'aria-label': tr2('debug'),
+            onChange: (e) => {
+              const next = e.target.checked
+              setOn(next)
+              writeDebugMode(next)
+            },
+            style: { flex: 'none', width: '16px', height: '16px', cursor: 'pointer' },
+          }))
+        }
+
+        // 设置放在【插件自己的详情页】里，而不是塞进通用设置。
+        //
+        // `plugins.row.config` 的 key 是 `<包名>#<行 id>`：注册它之后，
+        // 插件页那一行会多出一个「配置」入口，点开就是这个组件的内容。
+        // 这样插件的选项归属清晰，不会污染全局设置页。
+        function PluginSettings() {
+          return h('div', {
+            style: {
+              display: 'flex',
+              flexDirection: 'column',
+              gap: '4px',
+              width: '100%',
+              minWidth: 0,
+            },
+          },
+            h(FollowSetting, {}),
+            h(DebugSetting, {}),
+          )
+        }
+
+        const configKey = 'dsh-edit-diff#dsh-edit-diff'
+        ctx.effect(() => ctx.slots.inject('plugins.row.config', () => ctx.slots.register({
+          name: 'plugins.row.config',
+          key: configKey,
+          locale: 'editDiff',
+        }, PluginSettings)), 'dsh-edit-diff: plugin settings page')
+
         // 1) page 类型：并排 diff 标签（不接管任何文件扩展名）
+        //
+        // 刻意【不】声明 multiple：普通 page 标签在同一个 pane 内自动去重，
+        // 每次 openTab 只是把同一个标签的 navigation.params 换成新文件，
+        // 这正是我们要的「一个 diff 标签，始终跟随最新改动」。
+        // 若声明 multiple:true，每次 openTab 都会新开实例，同一文件连续编辑
+        // 会堆出一排重复标签，而且 revealIfOpened:false 对它不生效。
         ctx.effect(() => ctx.sidebarRightTabs.register({
           id: TAB_ID,
           kind: KIND,
           title: () => 'Edit Diff',
         }), 'dsh-edit-diff: diff tab type')
 
+        const DiffBody = createDiffBody(sessions, remote, (key) => (typeof t === 'function' ? t(key) : key))
         ctx.effect(() => ctx.slots.inject('sidebar.right.pane.tab', () => ctx.slots.register({
           name: 'sidebar.right.pane.tab',
           key: TAB_ID,
           locale: 'editDiff',
-        }, createDiffBody(remote, (key) => (typeof t === 'function' ? t(key) : key)))), 'dsh-edit-diff: diff body')
+          // slot 的 inject 按会话作用域调用，把 sessionId 直接交给组件：
+          // body 靠它订阅投影，不依赖导航参数（参数在标签复用时不会刷新）。
+          inject: (sessionId) => ({ sessionId }),
+        }, DiffBody)), 'dsh-edit-diff: diff body')
 
         // 2) 跟随：打开原生预览（高亮保留）+ 并排 diff 标签
         function openNative(sessionId, value) {
@@ -906,25 +1514,56 @@ window.__ModuleLoader__.load({
           }
         }
 
-        function openDiff(sessionId, value) {
-          // 同一会话的连续编辑只保留一个 diff 标签（page 类型在同一 pane 内去重），
-          // 但每次重新聚焦会打断用户，所以对短时间内的连击做节流。
+        /**
+         * 打开/刷新 diff 标签。
+         *
+         * 同一个 Edit Diff 标签承载本轮所有改动文件：每个文件一个可折叠分组。
+         * 所以这里不再为每个文件开标签，而是把所有文件塞进一次 openTab 的 params。
+         *
+         * @param files - 本轮改动过的全部文件（wire view 的 files）。
+         * @param value - 触发这次刷新的那一条（用来决定跳转行）。
+         * @param requestFocus - 是否把标签推到用户面前。
+         */
+        function openDiff(sessionId, files, value, requestFocus = true) {
           const now = Date.now()
           const previous = lastDiffAt.get(sessionId)
-          if (previous !== undefined && now - previous < DIFF_FOCUS_THROTTLE_MS) return
+          const burst = previous !== undefined && now - previous < DIFF_FOCUS_THROTTLE_MS
           lastDiffAt.set(sessionId, now)
+          const reveal = requestFocus && !burst
           try {
+            // 每个文件都带上基线与改动后内容，让标签能在一次渲染里画出全部分组。
+            // params 会进侧栏布局存档，所以只带中小文件；超限的退回读磁盘。
+            const packed = files.map((f) => {
+              const carry = f.beforeKnown === true &&
+                (f.beforeText === null || f.beforeText.length <= MAX_CARRY_BEFORE)
+              return {
+                path: normPath(f.path),
+                command: f.command,
+                line: f.line,
+                oldStr: f.oldStr,
+                newStr: f.newStr,
+                ts: f.ts,
+                ...(carry ? { beforeKnown: true, beforeText: f.beforeText } : {}),
+                ...(typeof f.afterText === 'string' && f.afterText.length <= MAX_CARRY_BEFORE
+                  ? { afterText: f.afterText }
+                  : {}),
+              }
+            })
             sidebarRight.openTab(KIND, {
               params: {
-                path: normPath(value.path),
                 sessionId,
+                files: packed,
+                // 兼容单文件路径：body 会优先用 files。
+                path: normPath(value.path),
                 command: value.command,
                 line: value.line,
                 oldStr: value.oldStr,
                 newStr: value.newStr,
                 ts: value.ts,
               },
+              ...(reveal ? {} : { revealIfOpened: false }),
             })
+            diffOpened.add(sessionId)
           } catch (err) {
             ctx.logger?.warn?.('[dsh-edit-diff] openTab failed:', err)
           }
@@ -941,15 +1580,48 @@ window.__ModuleLoader__.load({
           if (binding === undefined) return
 
           const face = binding.session.projections.faceOf(PROJECTION_KEY)
-          let lastTs = face.getSnapshot()?.ts
+          let lastTs = face.getSnapshot()?.last?.ts
+          // 每轮是否已经自动打开过（"turn" 模式用）。
+          let openedThisTurn = false
+          // 已经为哪些 (路径, ts) 开过标签，避免同一改动重复打开。
+          const seen = new Set()
+
           const unsubscribe = face.subscribe(() => {
-            const value = face.getSnapshot()
+            // wire view 现在是 { last, files }：last 驱动跳转，files 是本轮改过的全部文件。
+            const view = face.getSnapshot()
+            if (view === null || view === undefined) return
+            const value = view.last
             if (value === null || value === undefined) return
             if (lastTs === value.ts) return
+
+            // 新一轮：改动时间戳变小说明列表被重置过（turn/start 清空 turnFiles），
+            // 允许再自动聚焦一次。
+            if (lastTs !== undefined && value.ts < lastTs) {
+              openedThisTurn = false
+              seen.clear()
+            }
             lastTs = value.ts
             if (Date.now() - value.ts > MAX_AGE_MS) return
-            openNative(sessionId, value)
-            openDiff(sessionId, value)
+
+            const mode = readFollowMode()
+            const files = view.files ?? []
+
+            // 同一个 Edit Diff 标签承载全部文件：只调用一次 openTab，
+            // 把所有文件塞进 params，由标签内部渲染成可折叠分组。
+            if (mode === 'off') {
+              if (diffOpened.has(sessionId) && files.length > 0) {
+                openDiff(sessionId, files, value, false)
+              }
+              return
+            }
+
+            const focus = mode === 'always' || !openedThisTurn
+            openDiff(sessionId, files.length > 0 ? files : [value], value, focus)
+
+            if (focus) {
+              openedThisTurn = true
+              openNative(sessionId, value)
+            }
           })
           following.set(sessionId, unsubscribe)
         }
