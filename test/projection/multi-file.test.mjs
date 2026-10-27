@@ -1,9 +1,17 @@
 import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import vm from 'node:vm'
 
 // 验证两个修复：
 //   1) 一轮内改多个文件 → wire view 的 files 全部列出
 //   2) 内容没变的改动 → 不出现在 files 里（不再显示 +0 −0）
+
+// 夹具放在系统临时目录，跑完自动删；不再依赖 D:\Project\cline 这种机器相关路径。
+const FIXTURES = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-edit-diff-mf-'))
+process.on('exit', () => {
+  try { fs.rmSync(FIXTURES, { recursive: true, force: true }) } catch { /* 忽略 */ }
+})
 
 const src = fs.readFileSync('dsh-edit-diff/index.js', 'utf8')
 const body = src.replace(/^import .*$/gm, '').replace(/^export /gm, '')
@@ -38,7 +46,7 @@ const scratch = []
 
 function writeFile(name, content) {
   // 不用点号开头：插件会过滤这类临时产物（见 isScratchPath）。
-  const p = 'D:/Project/cline/mt-' + name
+  const p = path.join(FIXTURES, 'mt-' + name)
   fs.writeFileSync(p, content)
   scratch.push(p)
   return p

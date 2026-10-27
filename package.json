@@ -1,6 +1,6 @@
 {
   "name": "dsh-edit-diff",
-  "version": "0.16.1",
+  "version": "1.0.0",
   "description": "Follow the agent's edits in DeepSeek Harness: open the changed file in dsh's native preview (syntax highlighting and Markdown intact) and show a side-by-side diff tab with per-line and syntax highlighting, without ever replacing the built-in renderers.",
   "icon": "./icon.svg",
   "type": "module",
@@ -30,7 +30,7 @@
     "url": "https://github.com/Althrone/dsh-edit-diff/issues"
   },
   "scripts": {
-    "test": "node test/all-methods.test.mjs && node test/baseline.test.mjs && node test/client.test.mjs && node test/collapse-scope.test.mjs && node test/debug-notice.test.mjs && node test/diff.test.mjs && node test/five-fixes.test.mjs && node test/follow-mode.test.mjs && node test/highlight.test.mjs && node test/hooks-order.test.mjs && node test/host.test.mjs && node test/inject-guard.test.mjs && node test/live-turn.test.mjs && node test/markdown-new.test.mjs && node test/multi-file.test.mjs && node test/new-file-visible.test.mjs && node test/newfile-fix.test.mjs && node test/newfile-render.test.mjs && node test/no-drift.test.mjs && node test/no-empty-entries.test.mjs && node test/noise-filter.test.mjs && node test/per-turn.test.mjs && node test/projection-body.test.mjs && node test/real-file.test.mjs && node test/real-tools.test.mjs && node test/rename-consistency.test.mjs && node test/shell-content.test.mjs && node test/shell-paths.test.mjs && node test/shell-watch.test.mjs && node test/sync.test.mjs && node test/three-fixes.test.mjs && node test/turn-baseline.test.mjs"
+    "test": "node test/run.mjs"
   },
   "exports": {
     ".": "./index.js",

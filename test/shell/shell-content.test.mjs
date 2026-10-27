@@ -1,10 +1,18 @@
 import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import vm from 'node:vm'
 
 // shell 改动的快照与基线：
 //   · 有本轮基线 → 能显示前后对比
 //   · 没有基线   → 只报告「无法对比」，不假装相同
 //   · 内容没变   → 直接丢弃（不再产生 +0 −0 的空条目）
+
+// 夹具放在系统临时目录，跑完自动删；不再依赖 D:\Project\cline 这种机器相关路径。
+const FIXTURES = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-edit-diff-sc-'))
+process.on('exit', () => {
+  try { fs.rmSync(FIXTURES, { recursive: true, force: true }) } catch { /* 忽略 */ }
+})
 
 const src = fs.readFileSync('dsh-edit-diff/index.js', 'utf8')
 const body = src.replace(/^import .*$/gm, '').replace(/^export /gm, '')
@@ -44,7 +52,7 @@ let seq = 0
 function freshPath(content) {
   seq++
   // 不用点号开头：插件会过滤这类临时产物（见 isScratchPath）。
-  const p = 'D:/Project/cline/sc-probe-' + seq + '.c'
+  const p = path.join(FIXTURES, 'sc-probe-' + seq + '.c')
   fs.writeFileSync(p, content)
   scratchFiles.push(p)
   return p

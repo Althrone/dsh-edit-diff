@@ -40,6 +40,20 @@ ctx.documentPreviews.register({
 因为 diff 是一个**独立的 page 标签**（不声明 `patterns`，不接管任何扩展名），它和内置预览
 并存，互不影响。
 
+## 功能一览
+
+| 区域 | 能力 |
+|---|---|
+| 形态 | 独立 `editDiff.tab` 页面；并排左右两栏；同一行配对显示改动的「左删 / 右增」 |
+| 记录来源 | 编辑工具（`edit` / `write` / `multi_edit` / `apply_patch` / `str_replace_editor`）+ shell 命令（命令文本启发式解析 + `fs.watch`） |
+| 对比语义 | 一轮内累积（对比本轮首次编辑前）、跨轮重置；新建文件=整份新增；删除/无基线不列表 |
+| 多文件 | 一轮内每个文件一个可折叠分组，带 +/− 统计与文件计数；支持全部折叠/展开 |
+| 跟随 | 三档自动打开（每次 / 每轮首次 / 关闭）；可单独关闭「原生预览标签」 |
+| 跳转 | ▲/▼ 按**差异块**跳，序号 `3/7` 常显，当前块叠浅黄指示层，首尾回绕 |
+| 视图 | 行级红/绿着色；6 类语言词法高亮；行号槽按最大行号位数自适应 + 竖分隔线 |
+| 滚动 | 纵向只留中间一条竖条、左右逐行联动；横向共享列位置并按各自 max 截断 |
+| 元信息 | 标题/简介来自 `locale/*.json` 的 `meta`；图标来自 package.json 顶层 `icon` |
+
 ## 语法高亮
 
 diff 标签自带一个轻量词法高亮器（`LANGS` / `tokenizeLine`），支持 C/C++、JS/TS、Python、
@@ -50,7 +64,7 @@ Rust、Shell、JSON，**零依赖**：
 - 实现方式是「先标记字符串/注释等受保护区间，再在区间外匹配关键字与数字」，
   避免把字符串里的 `if` 染成关键字
 - 明暗两套配色，跟随 `body[data-ds-dark-theme]` 实时切换
-- 按行分词，不追求跨行状态（字符串/块注释不回渗），对 diff 阅读足够
+- 按行分词；C 风格块注释跨行时按状态延续（整行按注释着色），多行字符串不回渗
 - **每行分词后必须无损还原原文**，有测试锁住这条
 
 未知后缀不高亮，保持纯文本。
@@ -112,6 +126,16 @@ Host 半（`index.js`）用一个 `sessionProjections` 单元记录改动，通�
   更新但不抢焦点，避免打断用户
 - diff 标签每次拿到新导航都会重读磁盘，所以右栏始终是最新内容
 
+### 设置项（插件详情页）
+
+都在「设置 → 插件 → dsh-edit-diff → 配置」里，纯客户端偏好（localStorage），改完立即生效：
+
+| 设置 | key | 默认 | 作用 |
+|---|---|---|---|
+| 自动打开 | `dsh-edit-diff:follow` | `turn` | `always` 每次编辑都弹；`turn` 每轮首次弹；`off` 只更新不弹 |
+| 同时打开原生预览标签 | `dsh-edit-diff:native` | `1` | 关掉后只弹 diff 标签，不再为每个文件开原生预览 |
+| 调试信息 | `dsh-edit-diff:debug` | `0` | 显示「shell 改动没有基线」之类的内部提示 |
+
 ### 差异跳转（按块）
 
 - 表头的 ▲/▼ 按**差异块**（hunk）跳，不是逐行：连续改动只算一处，
@@ -134,6 +158,13 @@ Host 半（`index.js`）用一个 `sessionProjections` 单元记录改动，通�
   - 两栏都在最右，左移**长**栏 → 短栏一直钉住，直到长栏回到短栏的列位置才一起左移
   - 两栏都在最右，左移**短**栏 → 长栏直接跟到短栏的列位置
 
+### 行号槽
+
+- 宽度按**最大行号位数**算（`ch` 单位；等宽字体里 1ch 正好一位数字），不再写死 `3.2em`
+- 左右两栏共用同一个宽度，保证两栏代码文本的左边缘对齐
+- 行号与代码之间有一条 1px 竖分隔线（`--dsw-alias-border-l1`），亮/暗主题自适应
+- 对侧缺失的行用 `NBSP` 占位，行高不塌，纵向仍逐行对齐
+
 ## 安装
 
 ```text
@@ -152,21 +183,32 @@ plugin_manager  action: set_bundle  target: dsh-follow-edits  enabled: false
 ## 验证
 
 ```text
-node test/host.test.mjs        # 工具参数解析、投影状态机、schema 垫片
-node test/diff.test.mjs        # 行 diff 与并排配对（增/删/改/重复行）
-node test/real-tools.test.mjs  # 用真实工具 schema 驱动投影
-node test/real-file.test.mjs   # 对真实文件还原「修改前」并比对
-node test/shell-watch.test.mjs # fs.watch 能否捕获删除
-node test/sync.test.mjs        # 左右纵向联动、横向列位置联动与截断、防递归
-node test/highlight.test.mjs   # 词法高亮：关键字/类型/字符串/注释/无损还原
-node test/client.test.mjs      # client factory 装载、slot 注册、不碰 documentPreviews
+npm test              # 等价于 node test/run.mjs：递归跑 test/**/*.test.mjs 并汇总
+node test/run.mjs diff   # 只跑主题目录名或文件名里含 "diff" 的套件
 ```
+
+测试按主题分目录（`diff/`、`projection/`、`shell/`、`client/`、`turn/`、`newfile/`、`misc/`）：
+
+```text
+node test/run.mjs projection   # 工具参数解析、投影状态机、多文件、注入守卫
+node test/run.mjs client       # 装载、跟随、折叠、同步、块跳转、行号槽
+node test/run.mjs shell        # 命令路径解析、改动快照、fs.watch
+node test/run.mjs turn         # 单轮基线、跨轮重置、漂移
+node test/run.mjs newfile      # 新建文件、Markdown 新文件
+```
+
+- 夹具一律写在系统临时目录（`os.tmpdir()`），跑完自动清理，不依赖本机路径
+- 用例读的是 `dsh-edit-diff/client.js`（相对仓库父目录），`run.mjs` 会统一设好子进程 `cwd`
 
 ## 已知取舍
 
 - **diff 标签是独立页面**，不会嵌在原生预览里 —— 原生预览没有装饰扩展点，这是唯一不破坏高亮的选择。
 - **新建文件**只能看到「新增」，没有「修改前」一侧。
-- **shell 改动**没有 before/after 内容，只做跟随打开。
-- **高亮是按行词法**，跨行的块注释/多行字符串不会连续着色；只覆盖 6 类语言，其余后缀按纯文本显示。
+- **shell 改动**只有在命令文本里能解析出目标路径、且执行前成功快照到原文时才做完整对比；
+  路径藏在脚本内部、运行时拼接、或命令根本不含路径（`make`、`npm run build`）时只能事后捕获，
+  拿不到基线的条目**不显示**（避免空栏目噪音）。
+- **高亮是按行词法**，块注释跨行时按状态延续、多行字符串不延续；只覆盖 6 类语言，其余后缀纯文本。
 - **删除动作没有独立视图** —— 删除后文件不存在，diff 标签只显示「文件已不存在」。
 - 原生预览跳行：Markdown 渲染器不支持行锚点，只有纯文本和代码渲染器会响应 `line`。
+- 上限：基线整份读取 2 MiB；随导航参数携带的原文 256 KiB（超了回退读盘）；一轮内最多 64 条 shell 改动。
+- 横向联动依赖 `scroll` 事件，程序化写 `scrollLeft` 会产生回声，已用「记住自己写入值」的方式抑制。
