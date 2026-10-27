@@ -301,22 +301,49 @@ function editFromCall(data) {
   return null
 }
 
-function noteShellChange(sessionId, absolutePath) {
+/**
+ * 写文件常见是「先截断到 0 字节，再写入内容」：fs.watch 的事件可能正好落在
+ * 这个中间态。读到的空内容会被当成「改动后」，diff 就变成「左边整份文件，
+ * 右边空」。这类边界延迟一个短 tick 重读，最多重试两次。
+ */
+const SHELL_RETRY_MS = 80
+const shellRetryTimers = new Map()
+
+function retryShellSnapshot(sessionId, absolutePath, attempt) {
+  if (shellRetryTimers.has(absolutePath)) return
+  const timer = setTimeout(() => {
+    shellRetryTimers.delete(absolutePath)
+    noteShellChange(sessionId, absolutePath, attempt)
+  }, SHELL_RETRY_MS)
+  if (typeof timer.unref === 'function') timer.unref()
+  shellRetryTimers.set(absolutePath, timer)
+}
+
+function noteShellChange(sessionId, absolutePath, attempt = 0) {
   const now = Date.now()
   const previous = shellSeen.get(absolutePath)
   if (previous !== undefined && now - previous < SHELL_DEDUPE_MS) return
 
-  // 快照「改动后」的内容。探针验证过：fs.watch 回调触发时文件已经是新内容。
+  // 快照「改动后」的内容。探针验证过：fs.watch 回调触发时文件已经是新内容——
+  // 但「先截断后写入」的写法例外，0 字节的那次先放过去，稍后重读。
   let afterText = null
+  let truncated = false
   try {
     const stat = statSync(absolutePath)
-    if (stat.isFile() && stat.size <= MAX_BEFORE_BYTES) {
+    if (stat.isFile() && stat.size === 0) {
+      truncated = true
+    } else if (stat.isFile() && stat.size <= MAX_BEFORE_BYTES) {
       afterText = readFileSync(absolutePath, 'utf8')
       if (Buffer.byteLength(afterText, 'utf8') > MAX_BEFORE_BYTES) afterText = null
     }
   } catch {
     afterText = null
   }
+  if (truncated && attempt < 2) {
+    retryShellSnapshot(sessionId, absolutePath, attempt + 1)
+    return
+  }
+  if (truncated) return
 
   // 基线可能记在会话 id 下（pre-execute 能取到 agent 时），
   // 也可能记在兜底 key 下（取不到时）。两个都查，避免因 key 不同而丢基线。
@@ -792,6 +819,10 @@ export function apply(ctx) {
       try { watcher.close() } catch { /* 已关闭 */ }
     }
     shellWatchers.clear()
+    for (const timer of shellRetryTimers.values()) {
+      try { clearTimeout(timer) } catch { /* 已触发 */ }
+    }
+    shellRetryTimers.clear()
     turnBaseline.clear()
     beforeByCall.clear()
     lineByCall.clear()

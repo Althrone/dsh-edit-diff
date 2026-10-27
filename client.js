@@ -91,6 +91,34 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /**
+     * 自动打开 diff 标签时，是否【同时】打开每个改动文件的原生预览标签。
+     *
+     * 两者目的不同：原生预览负责「跳到改动行、保留语法高亮/Markdown」，
+     * diff 标签负责「并排看前后对比」。很多人只想要后者 —— 每改一个文件
+     * 就在侧栏多出一个原生标签，标签栏很快就被塞满。
+     *
+     * 默认 true，保持旧行为；关掉后仍会打开并聚焦 Edit Diff 标签本身。
+     */
+    const NATIVE_KEY = 'dsh-edit-diff:native'
+
+    function readNativeOpen() {
+      try {
+        const v = globalThis.localStorage?.getItem(NATIVE_KEY)
+        return v === null || v === undefined ? true : v === '1'
+      } catch {
+        return true
+      }
+    }
+
+    function writeNativeOpen(on) {
+      try {
+        globalThis.localStorage?.setItem(NATIVE_KEY, on ? '1' : '0')
+      } catch {
+        // localStorage 不可用时忽略
+      }
+    }
+
     const en = {
       title: 'Edit Diff',
       empty: 'No change recorded in this Session yet.',
@@ -113,6 +141,7 @@ window.__ModuleLoader__.load({
       expandAll: 'Expand all',
       fileCount: '{n} file(s)',
       debug: 'Debug info',
+      nativePreview: 'Also open the native preview tab',
       noBaseline: 'No before/after content recorded for this change.',
       noChanges: 'No textual change detected.',
       prevChange: 'Previous change',
@@ -140,6 +169,7 @@ window.__ModuleLoader__.load({
       expandAll: '全部展开',
       fileCount: '{n} 个文件',
       debug: '调试信息',
+      nativePreview: '同时打开原生预览标签',
       noBaseline: '这次改动没有记录到前后内容。',
       noChanges: '没有检测到文本变化。',
       prevChange: '上一处差异',
@@ -562,7 +592,6 @@ window.__ModuleLoader__.load({
     /**
      * 把一栏的纵向滚动镜像到另一栏。
      * 用 guard 防止 A→B 赋值触发 B 的监听再反过来写 A（无限递归）。
-     * 只同步 scrollTop：横向滚动是两栏独立的。
      */
     function mirrorScroll(from, to, guard = { current: false }) {
       return () => {
@@ -578,6 +607,47 @@ window.__ModuleLoader__.load({
       const guard = { current: false }
       const onLeft = mirrorScroll(left, right, guard)
       const onRight = mirrorScroll(right, left, guard)
+      left.addEventListener('scroll', onLeft)
+      right.addEventListener('scroll', onRight)
+      return () => {
+        left.removeEventListener('scroll', onLeft)
+        right.removeEventListener('scroll', onRight)
+      }
+    }
+
+    /**
+     * 横向联动：两栏共享同一个「列位置」，但各自按自己的最大可滚动距离截断。
+     *
+     * 规则只有一条：谁被拖动，就把它的 scrollLeft 写给另一栏，
+     * 写入前 clamp 到【对方】的 max（scrollWidth - clientWidth）。
+     *
+     * 这样自然得到几种想要的组合：
+     *  - 拖短栏到最右：长栏同步到同一列；短栏到底后停住，再拖长栏可继续右移，
+     *    短栏被 clamp 钉在自己的 max 上不动；
+     *  - 两栏都在最右，左移长栏：短栏仍被 clamp 钉住，直到长栏回到短栏的列位置，
+     *    两者才一起左移；
+     *  - 两栏都在最右，左移短栏：长栏直接跟到短栏的列位置（短栏到不了的地方没意义）。
+     *
+     * 程序化写 scrollLeft 会触发对方的 scroll 事件，形成回声。
+     * 所以记下「我刚写进去的值」，下一次该元素的事件只要还是这个值就忽略。
+     */
+    function linkHorizontalScroll(left, right) {
+      const echo = new Map([[left, null], [right, null]])
+      const mirror = (from, to) => () => {
+        const value = from.scrollLeft
+        const pending = echo.get(from)
+        echo.set(from, null)
+        // 自己刚写进去的那一次滚动：忽略，不要反向传播。
+        if (pending !== null && Math.abs(value - pending) < 1) return
+
+        const max = Math.max(0, (to.scrollWidth ?? 0) - (to.clientWidth ?? 0))
+        const next = Math.min(Math.max(0, value), max)
+        if (Math.abs(to.scrollLeft - next) < 1) return
+        echo.set(to, next)
+        to.scrollLeft = next
+      }
+      const onLeft = mirror(left, right)
+      const onRight = mirror(right, left)
       left.addEventListener('scroll', onLeft)
       right.addEventListener('scroll', onRight)
       return () => {
@@ -694,12 +764,25 @@ window.__ModuleLoader__.load({
           return undefined
         }, [sessionId])
 
-        const files = useMemo(
-          () => (Array.isArray(view?.files) ? view.files : []).filter(
+        /**
+         * 文件列表只来自投影。
+         *
+         * 刻意不从导航参数取（params 在标签复用时可能是上一轮的旧值，
+         * 这正是早期「标签只显示第一次改动」的根因，见 projection-body 测试）。
+         * 但投影里的 `files` 是【本轮】集合，`turn/start` 会清空它；
+         * 只剩 `last` 时就画最后一条改动，别留白。
+         */
+        const files = useMemo(() => {
+          const fromProjection = Array.isArray(view?.files) ? view.files : []
+          const list = fromProjection.length > 0
+            ? fromProjection
+            : view?.last
+              ? [view.last]
+              : []
+          return list.filter(
             (f) => f !== null && typeof f === 'object' && typeof f.path === 'string',
-          ),
-          [view],
-        )
+          )
+        }, [view])
 
         if (files.length === 0) {
           // 诊断信息：正常情况下用户看不到，但页面空白时必须能看出卡在哪一步。
@@ -992,6 +1075,23 @@ window.__ModuleLoader__.load({
         return { added, removed }
       }, [rows])
 
+      /**
+       * 行号槽位的宽度按「最大行号有几位」来定，而不是写死 3.2em。
+       *
+       * 取左右两侧行号的并集最大值（≈ 文件行数），两栏用同一个宽度，
+       * 这样左右代码文本的左边缘仍然对齐；行号变位数时槽位跟着变宽变窄。
+       * `ch` 在等宽字体里正好是一个数字宽，所以几位数字就给几 ch。
+       */
+      const gutterWidth = useMemo(() => {
+        let maxNo = 0
+        for (const row of rows) {
+          if (typeof row.leftNo === 'number' && row.leftNo > maxNo) maxNo = row.leftNo
+          if (typeof row.rightNo === 'number' && row.rightNo > maxNo) maxNo = row.rightNo
+        }
+        const digits = Math.max(1, String(maxNo).length)
+        return digits + 'ch'
+      }, [rows])
+
       let notice = null
       if (collapsed) {
         notice = null
@@ -1034,17 +1134,29 @@ window.__ModuleLoader__.load({
 
       // ── 表头：只有文件名 + 增删统计，点击折叠 ──
       // ── 差异跳转 ──
-      // 记录当前停在哪个改动块（rows 索引），null 表示还没跳过。
+      // 记录当前停在哪个「差异块」（blocks 的索引），null 表示还没跳过。
       const [diffCursor, setDiffCursor] = useState(null)
 
-      /** 所有改动块的首行索引（用于上/下跳转）。 */
-      const changeAnchors = useMemo(() => {
+      /**
+       * 把连续的改动行合并成差异块（hunk）。
+       *
+       * 逐行跳会毁体验：一次连续新增 20 行就要按 20 次 ▼。
+       * 这里只保留每块的首行，跳一次走完一整块。
+       */
+      const blocks = useMemo(() => {
         const out = []
         for (let i = 0; i < rows.length; i++) {
-          if (rows[i].type !== 'eq') out.push(i)
+          if (rows[i].type === 'eq') continue
+          let end = i
+          while (end + 1 < rows.length && rows[end + 1].type !== 'eq') end++
+          out.push({ start: i, end })
+          i = end
         }
         return out
       }, [rows])
+
+      // 行变了（新一次编辑）之后索引可能越界，按越界当作「没有选中块」。
+      const currentBlock = diffCursor === null ? null : (blocks[diffCursor] ?? null)
 
       /** 滚到某个 rows 索引对应的行。 */
       const scrollToRow = (index) => {
@@ -1056,20 +1168,29 @@ window.__ModuleLoader__.load({
         node.scrollTop = Math.max(0, top)
       }
 
-      /** 跳到下一处 / 上一处差异。 */
+      /** 跳到下一块 / 上一块差异。 */
       const jump = (direction) => {
-        if (changeAnchors.length === 0) return
-        const current = diffCursor === null ? -1 : changeAnchors.indexOf(diffCursor)
+        if (blocks.length === 0) return
+        const current = diffCursor === null || blocks[diffCursor] === undefined ? -1 : diffCursor
         let next
         if (direction > 0) {
-          next = current < 0 ? 0 : (current + 1) % changeAnchors.length
+          next = current < 0 ? 0 : (current + 1) % blocks.length
         } else {
-          next = current <= 0 ? changeAnchors.length - 1 : current - 1
+          next = current <= 0 ? blocks.length - 1 : current - 1
         }
-        const anchor = changeAnchors[next]
-        setDiffCursor(anchor)
-        scrollToRow(anchor)
+        setDiffCursor(next)
+        scrollToRow(blocks[next].start)
       }
+
+      // 差异块数量变了就校正游标：有块时至少停在第一块（指示器 x/y 从打开那一刻
+      // 就有意义，不必先点一次 ▼），块数变少导致越界时回到第一块。
+      useEffect(() => {
+        if (blocks.length === 0) {
+          if (diffCursor !== null) setDiffCursor(null)
+          return
+        }
+        if (diffCursor === null || blocks[diffCursor] === undefined) setDiffCursor(0)
+      }, [blocks, diffCursor])
 
       const jumpStyle = {
         flex: 'none',
@@ -1147,10 +1268,10 @@ window.__ModuleLoader__.load({
           }, '−' + stats.removed)
           : null,
         // 差异跳转：上一处 / 下一处。stopPropagation 避免触发表头的折叠。
-        changeAnchors.length === 0
+        blocks.length === 0
           ? null
           : h('span', {
-            style: { display: 'inline-flex', gap: '3px', flex: 'none', marginLeft: '2px' },
+            style: { display: 'inline-flex', gap: '3px', flex: 'none', marginLeft: '2px', alignItems: 'center' },
           },
             h('button', {
               type: 'button',
@@ -1168,6 +1289,18 @@ window.__ModuleLoader__.load({
               onClick: (e) => { e.stopPropagation(); jump(1) },
               style: jumpStyle,
             }, '▼'),
+            // 当前块序号；没跳过时不占位。
+            currentBlock === null
+              ? null
+              : h('span', {
+                style: {
+                  fontSize: '10.5px',
+                  lineHeight: '1',
+                  color: 'var(--dsw-alias-label-secondary)',
+                  flex: 'none',
+                  fontVariantNumeric: 'tabular-nums',
+                },
+              }, (diffCursor + 1) + '/' + blocks.length),
           ),
       )
 
@@ -1193,7 +1326,7 @@ window.__ModuleLoader__.load({
         return state
       }, [rows, lang])
 
-      // 纵向联动：左右两栏行数一致，滚一边另一边跟着走。
+      // 两栏联动：纵向逐行对齐，横向按「共享列位置 + 各自 max 截断」同步。
       // 必须在提前 return 之前注册（Hook 顺序要求）。
       const panesRendered = !collapsed && notice === null
       useEffect(() => {
@@ -1201,7 +1334,12 @@ window.__ModuleLoader__.load({
         const left = leftRef.current
         const right = rightRef.current
         if (left === null || right === null) return undefined
-        return linkVerticalScroll(left, right)
+        const unlinkVertical = linkVerticalScroll(left, right)
+        const unlinkHorizontal = linkHorizontalScroll(left, right)
+        return () => {
+          unlinkVertical()
+          unlinkHorizontal()
+        }
       }, [panesRendered, rows])
 
       if (collapsed) return h('div', { style: { flex: 'none' } }, header)
@@ -1238,6 +1376,9 @@ window.__ModuleLoader__.load({
         const lineNo = isLeft ? row.leftNo : row.rightNo
         const present = line !== undefined
         const tint = isLeft ? 'rgba(229, 72, 77, 0.10)' : 'rgba(46, 160, 67, 0.12)'
+        // 当前块的浅黄指示层：用半透明 backgroundImage 叠在红/绿底色之上，
+        // 所以底色（增/删/改）依然透得出来，两套信息可以同时读。
+        const marked = currentBlock !== null && index >= currentBlock.start && index <= currentBlock.end
         return h('div', {
           key: index,
           'data-cline-side-row': index,
@@ -1247,15 +1388,29 @@ window.__ModuleLoader__.load({
             padding: '0 8px',
             height: rowHeightPx + 'px',
             boxSizing: 'border-box',
-            background: !present
+            backgroundColor: !present
               ? 'var(--dsw-alias-bg-base)'
               : row.type === 'eq'
                 ? 'var(--dsw-specific-sidebar-fill)'
                 : tint,
+            ...(marked
+              ? { backgroundImage: 'linear-gradient(rgba(255, 199, 0, 0.26), rgba(255, 199, 0, 0.26))' }
+              : {}),
           },
         },
           h('span', {
-            style: { ...mono, width: '3.2em', textAlign: 'right', flex: 'none', color: 'var(--dsw-alias-label-secondary)' },
+            style: {
+              ...mono,
+              width: gutterWidth,
+              textAlign: 'right',
+              flex: 'none',
+              color: 'var(--dsw-alias-label-secondary)',
+              // 行号与代码之间的竖分隔线（VS Code 风格）
+              borderRight: '1px solid var(--dsw-alias-border-l1)',
+              paddingRight: '6px',
+              marginRight: '2px',
+              boxSizing: 'content-box',
+            },
           }, lineNo === undefined ? NBSP : String(lineNo)),
           h('span', {
             style: { ...mono, flex: 'none', color: 'var(--dsw-alias-label-primary)' },
@@ -1284,6 +1439,7 @@ window.__ModuleLoader__.load({
           }, label),
           h('div', {
             ref,
+            'data-cline-pane': side,
             style: {
               maxHeight: '60vh',
               minWidth: 0,
@@ -1372,6 +1528,26 @@ window.__ModuleLoader__.load({
 
         ctx.effect(() => ctx.locale.register('editDiff', { en, zh }), 'dsh-edit-diff: copy')
 
+        // 纵向滚动条只保留两栏中间那一条：右栏的竖条用 CSS 隐掉（滚动能力不变，
+        // 仍由纵向联动驱动）。横向条两栏都保留，长行各自平移。
+        // 用样式表而不是行内样式，是因为隐藏滚动条只能靠 ::-webkit-scrollbar。
+        ctx.effect(() => {
+          if (typeof document === 'undefined') return undefined
+          if (typeof document.createElement !== 'function') return undefined
+          if (document.head === undefined || document.head === null) return undefined
+          try {
+            const style = document.createElement('style')
+            style.setAttribute('data-dsh-edit-diff', 'scrollbars')
+            style.textContent =
+              '[data-cline-pane="right"]::-webkit-scrollbar:vertical{width:0;height:0}'
+            document.head.appendChild(style)
+            return () => { style.remove() }
+          } catch {
+            // 没有 DOM（测试/SSR 环境）就跳过，纯样式增强项
+            return undefined
+          }
+        }, 'dsh-edit-diff: single vertical scrollbar')
+
         // 设置项：自动打开行为。渲染在「设置 → 通用」里的一行。
         /** 设置行的小工具：左侧标签 + 右侧控件。 */
         function row(label, control) {
@@ -1443,6 +1619,22 @@ window.__ModuleLoader__.load({
           }))
         }
 
+        function NativeSetting() {
+          const [on, setOn] = useState(() => readNativeOpen())
+          const tr2 = (key) => (typeof t === 'function' ? t(key) : key)
+          return row(tr2('nativePreview'), h('input', {
+            type: 'checkbox',
+            checked: on,
+            'aria-label': tr2('nativePreview'),
+            onChange: (e) => {
+              const next = e.target.checked
+              setOn(next)
+              writeNativeOpen(next)
+            },
+            style: { flex: 'none', width: '16px', height: '16px', cursor: 'pointer' },
+          }))
+        }
+
         // 设置放在【插件自己的详情页】里，而不是塞进通用设置。
         //
         // `plugins.row.config` 的 key 是 `<包名>#<行 id>`：注册它之后，
@@ -1459,6 +1651,7 @@ window.__ModuleLoader__.load({
             },
           },
             h(FollowSetting, {}),
+            h(NativeSetting, {}),
             h(DebugSetting, {}),
           )
         }
@@ -1620,7 +1813,8 @@ window.__ModuleLoader__.load({
 
             if (focus) {
               openedThisTurn = true
-              openNative(sessionId, value)
+              // 只有显式打开时才去开原生预览；关掉后 diff 标签照样弹、照样抢焦点。
+              if (readNativeOpen()) openNative(sessionId, value)
             }
           })
           following.set(sessionId, unsubscribe)

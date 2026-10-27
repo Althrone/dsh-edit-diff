@@ -105,9 +105,34 @@ Host 半（`index.js`）用一个 `sessionProjections` 单元记录改动，通�
 ### 自动弹出 + 持续刷新
 
 - **首次编辑**：弹出侧栏、打开原生预览跳到改动行、并打开 diff 标签（会抢焦点）
+- 只想看并排对比、不想让侧栏堆满原生预览标签时，在「设置 → 插件 →
+  dsh-edit-diff → 配置」里关掉 **同时打开原生预览标签**：diff 标签照常自动弹出并抢焦点，
+  原生预览不再打开（偏好存在 `localStorage: dsh-edit-diff:native`，改完立即生效）
 - **连续编辑**（700ms 内）：复用同一个 diff 标签刷新内容，用 `revealIfOpened: false`
   更新但不抢焦点，避免打断用户
 - diff 标签每次拿到新导航都会重读磁盘，所以右栏始终是最新内容
+
+### 差异跳转（按块）
+
+- 表头的 ▲/▼ 按**差异块**（hunk）跳，不是逐行：连续改动只算一处，
+  跳一次走完整块
+- 块序号 `3/7` **常显**：打开标签时就默认停在第 1 块（不用先点 ▼），
+  之后随 ▲/▼ 移动
+- 当前块会盖一层**浅黄半透明**底色（`rgba(255,199,0,0.26)` 的
+  `backgroundImage`），叠在红/绿底色**之上**而不是替换它，
+  所以「哪一段是当前块」和「哪几行增/删」能同时看到
+- 横向两栏同时着色，纵向联动滚动；到首/尾会回绕
+
+### 滚动条
+
+- 纵向滚动条**只保留两栏中间那一条**：右栏的竖条用样式表隐掉
+  （`[data-cline-pane="right"]::-webkit-scrollbar:vertical`），滚动能力不变，
+  仍由左右联动同步
+- 横向滚动条两栏各自保留，但**共享同一个列位置**：拖动任一栏，另一栏跟到同一列，
+  然后按各自的最大可滚动距离截断。三种典型结果：
+  - 拖**短**栏到底 → 长栏跟到同一列；短栏停住，再拖长栏可继续右移，短栏被钉住不动
+  - 两栏都在最右，左移**长**栏 → 短栏一直钉住，直到长栏回到短栏的列位置才一起左移
+  - 两栏都在最右，左移**短**栏 → 长栏直接跟到短栏的列位置
 
 ## 安装
 
@@ -132,7 +157,7 @@ node test/diff.test.mjs        # 行 diff 与并排配对（增/删/改/重复�
 node test/real-tools.test.mjs  # 用真实工具 schema 驱动投影
 node test/real-file.test.mjs   # 对真实文件还原「修改前」并比对
 node test/shell-watch.test.mjs # fs.watch 能否捕获删除
-node test/sync.test.mjs        # 左右纵向滚动联动、防递归、横向独立
+node test/sync.test.mjs        # 左右纵向联动、横向列位置联动与截断、防递归
 node test/highlight.test.mjs   # 词法高亮：关键字/类型/字符串/注释/无损还原
 node test/client.test.mjs      # client factory 装载、slot 注册、不碰 documentPreviews
 ```
