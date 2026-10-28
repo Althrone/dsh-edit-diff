@@ -1,6 +1,6 @@
 {
   "name": "dsh-edit-diff",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Follow the agent's edits in DeepSeek Harness: open the changed file in dsh's native preview (syntax highlighting and Markdown intact) and show a side-by-side diff tab with per-line and syntax highlighting, without ever replacing the built-in renderers.",
   "icon": "./icon.svg",
   "type": "module",

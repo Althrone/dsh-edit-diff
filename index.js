@@ -365,11 +365,17 @@ function noteShellChange(sessionId, absolutePath, attempt = 0) {
     return
   }
 
-  if (shellSeen.size > MAX_SHELL_SEEN) shellSeen.clear()
-  shellSeen.set(absolutePath, now)
+  recordShellChange(sessionId, absolutePath, base, afterText, now)
+}
 
-  const beforeText = base
-  const beforeKnown = true
+/**
+ * 记一条 shell 改动。
+ * @param beforeText - 改动前内容；null 表示「原本不存在」（新建）。
+ * @param afterText - 改动后内容；null 表示读不到（文件被删/不可读）。
+ */
+function recordShellChange(sessionId, absolutePath, beforeText, afterText, ts) {
+  if (shellSeen.size > MAX_SHELL_SEEN) shellSeen.clear()
+  shellSeen.set(absolutePath, ts)
 
   // 记进本会话的改动列表（一轮内可能改多个文件，都要能显示）。
   let list = shellChangesBySession.get(sessionId)
@@ -379,10 +385,10 @@ function noteShellChange(sessionId, absolutePath, attempt = 0) {
   }
   list.set(normPath(absolutePath), {
     path: absolutePath,
-    ts: now,
+    ts,
     afterText,
     beforeText,
-    beforeKnown,
+    beforeKnown: true,
   })
   if (list.size > MAX_SHELL_CHANGES) {
     // 丢掉最旧的
@@ -447,17 +453,76 @@ async function snapshotShellTargets(ctx, exec) {
     const key = normPath(abs)
     // 本轮已经快照过就不覆盖：要的是「最先的样子」。
     if (byPath.has(key)) continue
+    let stat
     try {
-      const stat = statSync(abs)
-      if (!stat.isFile() || stat.size > MAX_BEFORE_BYTES) continue
+      stat = statSync(abs)
+    } catch {
+      // 文件还不存在：记一个 null 标记。命令跑完它若出现，就是「新建」；
+      // 这条标记也是后置扫描判断「新建 vs 没变」的依据。
+      if (byPath.size > MAX_BASELINE_PATHS) byPath.clear()
+      byPath.set(key, null)
+      continue
+    }
+    if (!stat.isFile() || stat.size > MAX_BEFORE_BYTES) continue
+    try {
       const content = readFileSync(abs, 'utf8')
       if (Buffer.byteLength(content, 'utf8') > MAX_BEFORE_BYTES) continue
       if (byPath.size > MAX_BASELINE_PATHS) byPath.clear()
       byPath.set(key, content)
     } catch {
-      // 读不到（不存在 / 无权限）就跳过；命令可能会创建它，
-      // 那种情况下基线本就该是「原本不存在」，由后续 shell 快照标为 null。
+      // 存在但读不到（无权限等）：没有可靠的基线，跳过。
     }
+  }
+}
+
+/**
+ * shell 命令执行【后】再扫一遍候选路径，和本轮基线比对。
+ *
+ * 为什么不能只靠 fs.watch：
+ *   · watch 只挂在会话工作区根上（见 watchSessionWorkspace），工作区外的文件
+ *     永远收不到事件；
+ *   · 事件还可能落在「先截断成 0 字节、再写入」的中间态。
+ * 命令结束时读盘没有这两个问题：内容一定已落盘，路径也不限于工作区。
+ *
+ * 只处理 pre-execute 阶段快照过的路径（没有基线就无从对比），并且用同步读，
+ * 让它能直接在 post-execute 里调用、也便于测试。
+ */
+function collectShellChangesAfter(exec) {
+  const sid = sessionIdOfAgent(exec?.agent) || FALLBACK_SESSION_KEY
+  const args = exec?.arguments
+  if (args === null || typeof args !== 'object') return
+  const command = typeof args.command === 'string' ? args.command : ''
+  const workdir = typeof args.workdir === 'string' && args.workdir.length > 0
+    ? args.workdir
+    : process.cwd()
+
+  const candidates = extractCommandPaths(command, workdir)
+  if (candidates.length === 0) return
+
+  const table = turnBaseline.get(sid) ?? turnBaseline.get(FALLBACK_SESSION_KEY)
+  if (table === undefined) return
+
+  for (const abs of candidates) {
+    const key = normPath(abs)
+    if (!table.has(key)) continue
+    if (isScratchPath(abs)) continue
+
+    const base = table.get(key)
+    let afterText = null
+    try {
+      const stat = statSync(abs)
+      if (stat.isFile() && stat.size <= MAX_BEFORE_BYTES) {
+        const text = readFileSync(abs, 'utf8')
+        if (Buffer.byteLength(text, 'utf8') <= MAX_BEFORE_BYTES) afterText = text
+      }
+    } catch {
+      afterText = null
+    }
+
+    // 内容没变（含「原本不存在、现在仍不存在」）就不记。
+    if (base === afterText) continue
+    if (base === null && afterText === null) continue
+    recordShellChange(sid, abs, base, afterText, Date.now())
   }
 }
 
@@ -769,6 +834,14 @@ export function apply(ctx) {
   // 界面上就只剩空栏。这里在编辑刚结束时读一次，客户端优先用它。
   ctx.on('tools/post-execute', async (exec, result, next) => {
     try {
+      // A4) shell / 脚本命令：命令结束后按「命令文本里的候选路径」逐个回读比对。
+      //     它覆盖 fs.watch 管不到的地方（尤其是工作区之外），也不受
+      //     「先截断成 0 字节再写入」的时序影响。
+      if (SHELL_TOOLS.has(String(exec?.name ?? ''))) {
+        collectShellChangesAfter(exec)
+        return next()
+      }
+
       const info = editFromCall(exec)
       const callId = typeof exec?.callId === 'string' ? exec.callId : null
       if (info !== null && callId !== null && result !== undefined) {

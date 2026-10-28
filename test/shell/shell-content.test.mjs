@@ -26,12 +26,12 @@ const hs = {
 hs.watch = () => ({ on() {}, close() {} })
 vm.createContext(hs)
 vm.runInContext(
-  body + '\n;globalThis.__h = { definition, turnBaseline, shellChangesBySession, normPath, noteShellChange, shellSeen, FALLBACK_SESSION_KEY };',
+  body + '\n;globalThis.__h = { definition, turnBaseline, shellChangesBySession, normPath, noteShellChange, collectShellChangesAfter, shellSeen, FALLBACK_SESSION_KEY };',
   hs,
 )
 const {
   definition, turnBaseline, shellChangesBySession, normPath,
-  noteShellChange, shellSeen, FALLBACK_SESSION_KEY,
+  noteShellChange, collectShellChangesAfter, shellSeen, FALLBACK_SESSION_KEY,
 } = hs.__h
 
 let failures = 0
@@ -167,6 +167,66 @@ check('客户端：有基线时能算出对比行', async () => {
   const before = 'BEFORE\n'
   const after = 'AFTER\n'
   if (before === after) throw new Error('fixture broken')
+})
+
+// ── 后置扫描：命令结束后回读候选路径 ──────────────────────────────
+//
+// 这一路专门补 fs.watch 的两个盲区：工作区之外的文件、以及「先截断再写」
+// 的中间态。夹具放在系统临时目录，本身就在会话工作区（D:/w）之外。
+
+check('后置扫描：能记录工作区外的文件改动', () => {
+  resetShell()
+  const f = freshPath('AFTER\n')
+  turnBaseline.set(SESSION, new Map([[normPath(f), 'BEFORE\n']]))
+  collectShellChangesAfter({
+    name: 'pwsh',
+    arguments: { command: 'Set-Content -Path ' + f + ' -Value AFTER', workdir: 'D:/w' },
+    agent: { id: SESSION },
+  })
+  const e = entryOf(SESSION, f)
+  if (e === undefined) throw new Error('工作区外的改动没有被记录')
+  if (e.beforeText !== 'BEFORE\n') throw new Error('beforeText=' + JSON.stringify(e.beforeText))
+  if (e.afterText !== 'AFTER\n') throw new Error('afterText=' + JSON.stringify(e.afterText))
+})
+
+check('后置扫描：新建文件记成 before=null', () => {
+  resetShell()
+  const f = path.join(FIXTURES, 'sc-created-' + (seq++) + '.c')
+  // pre-execute 阶段：文件还不存在 → 基线记 null
+  turnBaseline.set(SESSION, new Map([[normPath(f), null]]))
+  fs.writeFileSync(f, 'created\n')
+  collectShellChangesAfter({
+    name: 'pwsh',
+    arguments: { command: 'Set-Content -Path ' + f + ' -Value created' },
+    agent: { id: SESSION },
+  })
+  const e = entryOf(SESSION, f)
+  if (e === undefined) throw new Error('新建文件没有被记录')
+  if (e.beforeText !== null) throw new Error('beforeText=' + JSON.stringify(e.beforeText))
+  if (e.afterText !== 'created\n') throw new Error('afterText=' + JSON.stringify(e.afterText))
+})
+
+check('后置扫描：内容没变则不记', () => {
+  resetShell()
+  const f = freshPath('SAME\n')
+  turnBaseline.set(SESSION, new Map([[normPath(f), 'SAME\n']]))
+  collectShellChangesAfter({
+    name: 'pwsh',
+    arguments: { command: 'Get-Content ' + f },
+    agent: { id: SESSION },
+  })
+  if (entryOf(SESSION, f) !== undefined) throw new Error('unchanged content was recorded')
+})
+
+check('后置扫描：没快照过的路径不记', () => {
+  resetShell()
+  const f = freshPath('AFTER\n')
+  collectShellChangesAfter({
+    name: 'pwsh',
+    arguments: { command: 'Set-Content -Path ' + f + ' -Value x' },
+    agent: { id: SESSION },
+  })
+  if (entryOf(SESSION, f) !== undefined) throw new Error('recorded without a baseline')
 })
 
 for (const f of scratchFiles) {
